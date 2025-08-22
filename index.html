@@ -1,0 +1,269 @@
+import React, { useState, useEffect } from 'react';
+import { createRoot } from 'react-dom/client';
+import {
+  collection,
+  query,
+  onSnapshot,
+  orderBy,
+  limit,
+  addDoc,
+  Timestamp,
+  getFirestore
+} from 'firebase/firestore';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  onAuthStateChanged,
+  signInWithCustomToken,
+  signInAnonymously
+} from 'firebase/auth';
+import { v4 as uuidv4 } from 'uuid';
+
+// Firebase configuration using global variable
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// The main App component
+const App = () => {
+  const [links, setLinks] = useState([]);
+  const [showEditor, setShowEditor] = useState(false);
+  const [editorContent, setEditorContent] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
+  const [showArchive, setShowArchive] = useState(false);
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Initialize Firebase and set up auth state listener
+  useEffect(() => {
+    if (!firebaseConfig.apiKey) {
+      console.error("Firebase config is missing. App will not function.");
+      return;
+    }
+
+    const app = initializeApp(firebaseConfig);
+    const firestore = getFirestore(app);
+    const authInstance = getAuth(app);
+
+    setDb(firestore);
+    setAuth(authInstance);
+
+    const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(authInstance, initialAuthToken);
+          } else {
+            await signInAnonymously(authInstance);
+          }
+        } catch (error) {
+          console.error("Firebase authentication failed:", error);
+          setUserId(null);
+        }
+      }
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribe();
+  }, [initialAuthToken]);
+
+  // Fetch links from Firestore in real-time
+  useEffect(() => {
+    if (!db || !isAuthReady) return;
+
+    const linksCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'links');
+    const linksQuery = showArchive
+      ? query(linksCollectionRef, orderBy('timestamp', 'desc'))
+      : query(linksCollectionRef, orderBy('timestamp', 'desc'), limit(10));
+
+    const unsubscribe = onSnapshot(linksQuery, (snapshot) => {
+      const fetchedLinks = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          title: data.title,
+          url: data.url,
+          color: data.color || 'blue',
+          timestamp: data.timestamp
+        };
+      });
+      setLinks(fetchedLinks);
+    }, (error) => {
+      console.error("Error fetching links:", error);
+    });
+
+    return () => unsubscribe();
+  }, [db, isAuthReady, showArchive]);
+
+  // Handler for saving links to Firestore
+  const handleSaveLinks = async () => {
+    if (!db || !userId) {
+      console.error("Database not initialized or user not authenticated.");
+      setStatusMessage("Error: Could not save links. Authentication failed.");
+      return;
+    }
+
+    let parsedLinks = [];
+    try {
+      parsedLinks = JSON.parse(editorContent);
+    } catch (error) {
+      setStatusMessage("Error: Invalid JSON format. Please check your links.");
+      return;
+    }
+
+    setStatusMessage('Saving...');
+
+    try {
+      // First, get all existing links to determine which ones to delete
+      const existingLinksSnapshot = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'links'));
+      const existingLinkIds = existingLinksSnapshot.docs.map(doc => doc.id);
+      const newLinkUrls = parsedLinks.map(link => link.url);
+
+      // Delete links that are in Firestore but not in the new list
+      const linksToDelete = existingLinkIds.filter(id => !newLinkUrls.includes(links.find(l => l.id === id)?.url));
+      for (const linkId of linksToDelete) {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'links', linkId));
+      }
+
+      // Add/update new links
+      for (const link of parsedLinks) {
+        const existingLink = links.find(l => l.url === link.url);
+        if (existingLink) {
+          // Update existing link if needed, though this app's logic adds new ones
+          await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'links', existingLink.id), {
+            title: link.title,
+            url: link.url,
+            color: link.color || 'blue',
+            timestamp: existingLink.timestamp // Preserve original timestamp
+          });
+        } else {
+          await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'links'), {
+            title: link.title,
+            url: link.url,
+            color: link.color || 'blue',
+            timestamp: Timestamp.now()
+          });
+        }
+      }
+
+      setStatusMessage('Links updated in real-time.');
+      setTimeout(() => setStatusMessage(''), 3000);
+    } catch (error) {
+      console.error("Error saving links:", error);
+      setStatusMessage('Error: Failed to save links.');
+    }
+  };
+
+
+  const getLinkColor = (colorName) => {
+    const colors = {
+      red: 'text-red-500 hover:text-red-400',
+      blue: 'text-blue-500 hover:text-blue-400',
+      black: 'text-black hover:text-gray-700',
+      gray: 'text-gray-500 hover:text-gray-400',
+      green: 'text-green-500 hover:text-green-400',
+      purple: 'text-purple-500 hover:text-purple-400',
+    };
+    return colors[colorName] || colors.blue;
+  };
+
+  const handleEditorToggle = () => {
+    if (!showEditor) {
+      const currentLinksString = JSON.stringify(links.map(({ id, timestamp, ...rest }) => rest), null, 2);
+      setEditorContent(currentLinksString);
+    }
+    setShowEditor(!showEditor);
+  };
+
+  const handleToggleArchive = () => {
+    setShowArchive(!showArchive);
+  };
+
+  const handleLinkClick = (url) => {
+    // Check if the URL has a protocol, if not, assume https
+    const formattedUrl = url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
+    window.open(formattedUrl, '_blank');
+  };
+  
+  // Return the main App UI
+  return (
+    <div className="min-h-screen bg-white text-black p-4 md:p-8 flex flex-col items-center font-['Inter'] transition-colors duration-500">
+      <div className="w-full max-w-2xl text-center flex flex-col items-center">
+        <h1
+          className="text-4xl md:text-5xl font-extrabold text-black cursor-pointer mb-8 transition-colors duration-300"
+          onClick={handleEditorToggle}
+        >
+          THE DAY LUGE
+        </h1>
+
+        <div className="w-full flex justify-center mb-8">
+          <button
+            onClick={handleToggleArchive}
+            className="px-4 py-2 text-sm md:text-base font-semibold text-gray-700 bg-gray-200 rounded-full hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400 transition-all duration-300 shadow-md"
+          >
+            {showArchive ? 'View Recent Links' : 'View Full Archive'}
+          </button>
+        </div>
+
+        <div className="w-full space-y-4 mb-8">
+          {links.length > 0 ? (
+            links.map(link => (
+              <a
+                key={link.id}
+                href="#"
+                onClick={(e) => { e.preventDefault(); handleLinkClick(link.url); }}
+                className={`w-full block px-6 py-4 rounded-lg text-lg md:text-xl font-medium shadow-lg transition-all duration-300 ease-in-out transform hover:scale-105 hover:shadow-2xl bg-white ${getLinkColor(link.color)}`}
+              >
+                {link.title}
+              </a>
+            ))
+          ) : (
+            <p className="text-gray-500 text-lg">No links to display. Add some using the editor!</p>
+          )}
+        </div>
+        
+        {showEditor && (
+          <div className="w-full mt-8 p-4 bg-gray-100 rounded-lg shadow-inner transition-all duration-500 ease-in-out">
+            <h2 className="text-xl font-bold mb-2">Link Editor</h2>
+            <textarea
+              className="w-full h-48 p-2 rounded-md border border-gray-300 font-mono text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors duration-200"
+              value={editorContent}
+              onChange={(e) => setEditorContent(e.target.value)}
+            />
+            <div className="flex justify-between items-center mt-4">
+              <button
+                onClick={handleSaveLinks}
+                className="px-6 py-2 bg-black text-white rounded-full font-semibold shadow-md hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-black transition-all duration-300"
+              >
+                Save Links
+              </button>
+              <span className="text-sm font-medium text-gray-600">
+                {statusMessage}
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Valid JSON format required. Use a tool like `jsonlint.com` to check your formatting.
+            </p>
+          </div>
+        )}
+        
+        <div className="text-center text-gray-500 text-sm mt-8">
+          Your User ID: {userId || 'Authenticating...'}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Use createRoot for modern React
+const container = document.getElementById('root');
+if (container) {
+  const root = createRoot(container);
+  root.render(<App />);
+}
+
+export default App;
